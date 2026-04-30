@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jc-podcaster"
+version = "0.1.0"
+description = "A path-based RSS podcast server for local MP3s"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Jeff Clough", email = "jeff@cloughcottage.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+]
+dependencies = [
+    "feedgen2>=0.1.0",
+]
+
+[project.scripts]
+podcaster = "podcaster.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
