@@ -5,15 +5,33 @@ import urllib.parse
 import threading
 import shutil
 import tomllib
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from feedgen.feed import FeedGenerator
 
 # Configuration
-MEDIA_BASE_DIR = Path("/Users/jeff/Music/Podcasts")
-HOST_NAME = "localhost"
+MEDIA_BASE_DIR = Path("~/Music/Podcasts").expanduser()
 PORT = 8080
+
+def get_local_ip():
+    """
+    Retrieves the local IP address of the machine.
+    Works by triggering the OS routing table without sending data.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't even have to be reachable
+        s.connect(('8.8.8.8', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+LOCAL_IP = get_local_ip()
 
 class PodcastHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -30,41 +48,41 @@ class PodcastHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, f"Internal Server Error: {e}")
 
-    def generate_rss(self, artist: str, album: str):
-        album_path = MEDIA_BASE_DIR / artist / album
-        if not album_path.is_dir():
-            self.send_error(404, "Course directory not found.")
+    def generate_rss(self, creator: str, podcast: str):
+        podcast_path = MEDIA_BASE_DIR / creator / podcast
+        if not podcast_path.is_dir():
+            self.send_error(404, f"Course directory '{podcast_path}' not found.")
             return
 
         # 1. Load Local Configuration (podcaster.toml)
         config = {}
-        config_path = album_path / "podcaster.toml"
+        config_path = podcast_path / "podcaster.toml"
         if config_path.exists():
             with open(config_path, "rb") as f:
                 config = tomllib.load(f)
 
         # 2. Extract Metadata with Defaults
-        title = config.get("title", f"{artist}: {album}")
-        description = config.get("description", f"Lectures for {album}")
+        title = config.get("title", f"{creator}: {podcast}")
+        description = config.get("description", f"Lectures for {podcast}")
 
         # Anchoring the date (Default to 2026-01-01 if not provided)
         start_date_str = config.get("start_date", "2026-01-01")
         current_date = datetime.fromisoformat(start_date_str).replace(tzinfo=timezone.utc)
 
         # 3. Look for supplementary PDF
-        pdf_file = next(album_path.glob("*.pdf"), None)
+        pdf_file = next(podcast_path.glob("*.pdf"), None)
         if pdf_file:
-            pdf_url = f"http://{HOST_NAME}:{PORT}/{artist}/{album}/{urllib.parse.quote(pdf_file.name)}"
+            pdf_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{urllib.parse.quote(pdf_file.name)}"
             description += f'\n\nCourse Handouts (PDF): <a href="{pdf_url}">Download Here</a>'
 
         fg = FeedGenerator()
         fg.load_extension('podcast')
         fg.title(title)
         fg.description(description)
-        fg.link(href=f"http://{HOST_NAME}:{PORT}/{artist}/{album}", rel='alternate')
+        fg.link(href=f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}", rel='alternate')
 
         # 4. Generate Episodes
-        for mp3 in sorted(album_path.glob("*.mp3")):
+        for mp3 in sorted(podcast_path.glob("*.mp3")):
             fe = fg.add_entry()
             fe.id(mp3.name)
             fe.title(mp3.stem)
@@ -74,7 +92,7 @@ class PodcastHandler(BaseHTTPRequestHandler):
             current_date += timedelta(days=1)
 
             safe_name = urllib.parse.quote(mp3.name)
-            file_url = f"http://{HOST_NAME}:{PORT}/{artist}/{album}/{safe_name}"
+            file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
             fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
 
         response = fg.rss_str(pretty=True)
@@ -83,8 +101,8 @@ class PodcastHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response)
 
-    def serve_file(self, artist, album, filename):
-        file_path = MEDIA_BASE_DIR / artist / album / filename
+    def serve_file(self, creator, podcast, filename):
+        file_path = MEDIA_BASE_DIR / creator / podcast / filename
         if not file_path.exists():
             self.send_error(404)
             return
@@ -103,12 +121,26 @@ class PodcastHandler(BaseHTTPRequestHandler):
 class PodcasterService:
     """Manages the lifecycle of the ThreadingHTTPServer."""
     def __init__(self):
-        self.server = ThreadingHTTPServer((HOST_NAME, PORT), PodcastHandler)
+        self.server = ThreadingHTTPServer(('', PORT), PodcastHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=False)
         self.exit_event = threading.Event()
 
     def start(self):
-        print(f"Podcaster listening on http://{HOST_NAME}:{PORT}")
+        print(f"Podcaster listening on http://{LOCAL_IP}:{PORT}")
+        # List the available podcast directories.
+        print("Available Podcast URLs:")
+        for podcast_path in sorted(MEDIA_BASE_DIR.glob("*/*/")):
+            # Make sure we have both a creator and a podcast name.
+            parts = podcast_path.relative_to(MEDIA_BASE_DIR).parts
+            if len(parts)!=2:
+                continue
+            creator,podcast_name=parts
+            # Make sure we ignore hidden directories.
+            if creator.startswith('.') or podcast_name.startswith('.'):
+                continue
+            # Print the URL-quoted URL we've found.
+            path=urllib.parse.quote(f"{creator}/{podcast_name}")
+            print(f"  http://{LOCAL_IP}:{PORT}/{path}")
         self.server_thread.start()
 
     def stop(self, signum=None, frame=None):
