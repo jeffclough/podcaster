@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "feedgen2>=0.1.0",
+    "eyed3>=0.9.9",
 ]
 
 [project.scripts]

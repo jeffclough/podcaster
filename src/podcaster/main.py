@@ -6,6 +6,7 @@ import threading
 import shutil
 import tomllib
 import socket
+import eyed3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -62,13 +63,18 @@ class PodcastHandler(BaseHTTPRequestHandler):
                 config = tomllib.load(f)
 
         # 2. Extract Metadata with Defaults
-        title = config.get("title", f"{creator}: {podcast}")
-        description = config.get("description", f"Lectures for {podcast}")
+        group=config.get('podcast',{})
+        title = group.get("title", f"{creator}: {podcast}")
+        description = group.get("description", "")
 
-        # Anchoring the date (Default to 2026-01-01 if not provided)
-        start_date_str = config.get("start_date", "2026-01-01")
-        current_date = datetime.fromisoformat(start_date_str).replace(tzinfo=timezone.utc)
-
+        # Anchoring the date (Default to Noon on 2026-01-01 if not provided)
+        group=config.get('episodes',{})
+        start_time_str = group.get("start_time", "2026-01-01T12:00:00")
+        print(f"{start_time_str=}")
+        start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=timezone.utc)
+        time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
+        use_recording_date = group.get("use_recording_date",False)
+        
         # 3. Look for supplementary PDF
         pdf_file = next(podcast_path.glob("*.pdf"), None)
         if pdf_file:
@@ -82,14 +88,33 @@ class PodcastHandler(BaseHTTPRequestHandler):
         fg.link(href=f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}", rel='alternate')
 
         # 4. Generate Episodes
+        # Set up to supply our own publication date values (just in case).
+        pub_date=start_time
         for mp3 in sorted(podcast_path.glob("*.mp3")):
             fe = fg.add_entry()
             fe.id(mp3.name)
             fe.title(mp3.stem)
 
-            # Use anchored date, incrementing by 1 day per lecture
-            fe.pubDate(current_date)
-            current_date += timedelta(days=1)
+            # Either get the publication date from the MP3 file or use
+            # the pub_date value we're maintaining in this loop. In
+            # either case, set this episode's publication date
+            # accordingly.
+            if use_recording_date:
+                afile = eyed3.load(mp3)
+                print(f"{afile=}")
+                if afile:
+                    print(f"{afile.tag=}")
+                    d = afile.tag.getBestDate()
+                    print(f"{d=}")
+                    print(f"{d.year=}, {d.month=}, {d.day=}")
+                    print(f"{d.hour=}, {d.minute=}, {d.second=}")
+                    pub_date = datetime(
+                        year=d.year, month=d.month, day=d.day,
+                        hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
+                        tzinfo=timezone.utc
+                    )
+            fe.pubDate(pub_date)
+            pub_date += time_interval
 
             safe_name = urllib.parse.quote(mp3.name)
             file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
