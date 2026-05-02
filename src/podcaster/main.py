@@ -70,9 +70,10 @@ class PodcastHandler(BaseHTTPRequestHandler):
         # Anchoring the date (Default to Noon on 2026-01-01 if not provided)
         group=config.get('episodes',{})
         start_time_str = group.get("start_time", "2026-01-01T12:00:00")
-        print(f"{start_time_str=}")
+        time_interval = group.get("time_interval", dict(days=1))
         start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=timezone.utc)
-        time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
+        #time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
+        time_interval = timedelta(**time_interval)
         use_recording_date = group.get("use_recording_date",False)
         
         # 3. Look for supplementary PDF
@@ -101,13 +102,8 @@ class PodcastHandler(BaseHTTPRequestHandler):
             # accordingly.
             if use_recording_date:
                 afile = eyed3.load(mp3)
-                print(f"{afile=}")
                 if afile:
-                    print(f"{afile.tag=}")
                     d = afile.tag.getBestDate()
-                    print(f"{d=}")
-                    print(f"{d.year=}, {d.month=}, {d.day=}")
-                    print(f"{d.hour=}, {d.minute=}, {d.second=}")
                     pub_date = datetime(
                         year=d.year, month=d.month, day=d.day,
                         hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
