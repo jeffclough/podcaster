@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-import sys
-import signal
-import urllib.parse
-import threading
-import shutil
-import tomllib
-import socket
 import eyed3
+import shutil
+import signal
+import socket
+import sys
+import threading
+import tomllib
+import traceback
+import urllib.parse
+from argparse import ArgumentParser
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from feedgen.feed import FeedGenerator
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 # Configuration
 MEDIA_BASE_DIR = Path("~/Music/Podcasts").expanduser()
@@ -50,77 +52,81 @@ class PodcastHandler(BaseHTTPRequestHandler):
             self.send_error(500, f"Internal Server Error: {e}")
 
     def generate_rss(self, creator: str, podcast: str):
-        podcast_path = MEDIA_BASE_DIR / creator / podcast
-        if not podcast_path.is_dir():
-            self.send_error(404, f"Course directory '{podcast_path}' not found.")
-            return
+        try:
+            podcast_path = Path(urllib.parse.unquote(str(MEDIA_BASE_DIR/creator/podcast)))
+            if not podcast_path.is_dir():
+                self.send_error(404, f"Course directory '{podcast_path}' not found.")
+                return
 
-        # 1. Load Local Configuration (podcaster.toml)
-        config = {}
-        config_path = podcast_path / "podcaster.toml"
-        if config_path.exists():
-            with open(config_path, "rb") as f:
-                config = tomllib.load(f)
+            # 1. Load Local Configuration (podcaster.toml)
+            config = {}
+            config_path = podcast_path / "podcaster.toml"
+            if config_path.exists():
+                with open(config_path, "rb") as f:
+                    config = tomllib.load(f)
 
-        # 2. Extract Metadata with Defaults
-        group=config.get('podcast',{})
-        title = group.get("title", f"{creator}: {podcast}")
-        description = group.get("description", "")
+            # 2. Extract Metadata with Defaults
+            group=config.get('podcast',{})
+            title = group.get("title", f"{creator}: {podcast}")
+            description = group.get("description", f"Podcast: {podcast}\nFrom: {creator}")
 
-        # Anchoring the date (Default to Noon on 2026-01-01 if not provided)
-        group=config.get('episodes',{})
-        start_time_str = group.get("start_time", "2026-01-01T12:00:00")
-        time_interval = group.get("time_interval", dict(days=1))
-        start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=timezone.utc)
-        #time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
-        time_interval = timedelta(**time_interval)
-        use_recording_date = group.get("use_recording_date",False)
-        
-        # 3. Look for supplementary PDF
-        pdf_file = next(podcast_path.glob("*.pdf"), None)
-        if pdf_file:
-            pdf_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{urllib.parse.quote(pdf_file.name)}"
-            description += f'\n\nCourse Handouts (PDF): <a href="{pdf_url}">Download Here</a>'
+            # Anchoring the date (Default to Noon on 2026-01-01 if not provided)
+            group=config.get('episodes',{})
+            start_time_str = group.get("start_time", "2026-01-01T12:00:00")
+            time_interval = group.get("time_interval", dict(days=1))
+            start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=timezone.utc)
+            #time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
+            time_interval = timedelta(**time_interval)
+            use_recording_date = group.get("use_recording_date",False)
+            
+            # 3. Look for supplementary PDF
+            pdf_file = next(podcast_path.glob("*.pdf"), None)
+            if pdf_file:
+                pdf_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{urllib.parse.quote(pdf_file.name)}"
+                description += f'\n\nCourse Handouts (PDF): <a href="{pdf_url}">Download Here</a>'
 
-        fg = FeedGenerator()
-        fg.load_extension('podcast')
-        fg.title(title)
-        fg.description(description)
-        fg.link(href=f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}", rel='alternate')
+            fg = FeedGenerator()
+            fg.load_extension('podcast')
+            fg.title(title)
+            fg.description(description)
+            fg.link(href=f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}", rel='alternate')
 
-        # 4. Generate Episodes
-        # Set up to supply our own publication date values (just in case).
-        pub_date=start_time
-        for mp3 in sorted(podcast_path.glob("*.mp3")):
-            fe = fg.add_entry()
-            fe.id(mp3.name)
-            fe.title(mp3.stem)
+            # 4. Generate Episodes
+            # Set up to supply our own publication date values (just in case).
+            pub_date=start_time
+            for mp3 in sorted(podcast_path.glob("*.mp3")):
+                fe = fg.add_entry()
+                fe.id(mp3.name)
+                fe.title(mp3.stem)
 
-            # Either get the publication date from the MP3 file or use
-            # the pub_date value we're maintaining in this loop. In
-            # either case, set this episode's publication date
-            # accordingly.
-            if use_recording_date:
-                afile = eyed3.load(mp3)
-                if afile:
-                    d = afile.tag.getBestDate()
-                    pub_date = datetime(
-                        year=d.year, month=d.month, day=d.day,
-                        hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
-                        tzinfo=timezone.utc
-                    )
-            fe.pubDate(pub_date)
-            pub_date += time_interval
+                # Either get the publication date from the MP3 file or use
+                # the pub_date value we're maintaining in this loop. In
+                # either case, set this episode's publication date
+                # accordingly.
+                if use_recording_date:
+                    afile = eyed3.load(mp3)
+                    if afile:
+                        d = afile.tag.getBestDate()
+                        pub_date = datetime(
+                            year=d.year, month=d.month, day=d.day,
+                            hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
+                            tzinfo=timezone.utc
+                        )
+                fe.pubDate(pub_date)
+                pub_date += time_interval
 
-            safe_name = urllib.parse.quote(mp3.name)
-            file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
-            fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
+                safe_name = urllib.parse.quote(mp3.name)
+                file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
+                fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
 
-        response = fg.rss_str(pretty=True)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/rss+xml")
-        self.end_headers()
-        self.wfile.write(response)
+            response = fg.rss_str(pretty=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml")
+            self.end_headers()
+            self.wfile.write(response)
+        except Exception as e:
+            print(traceback.format_exc())
+            raise
 
     def serve_file(self, creator, podcast, filename):
         file_path = MEDIA_BASE_DIR / creator / podcast / filename
@@ -173,7 +179,7 @@ class PodcasterService:
         self.server_thread.join() # Wait for active requests to finish
         self.exit_event.set()
 
-def main():
+def run_service():
     service = PodcasterService()
 
     # Register OS signals for clean termination
@@ -185,6 +191,100 @@ def main():
     # Main thread parks here until shutdown is triggered
     service.exit_event.wait()
     print("Process exited cleanly.")
+
+def say(msg,rc=None):
+    print(f"{Path(sys.argv[0]).stem}: {msg}")
+    if rc is not None:
+        sys.exit(rc)
+
+class Episode():
+    def __init__(self,path):
+        if not isinstance(path,Path):
+            path=Path(path)
+        self.path=path
+        self.mp3=eyed3.load(self.path)
+        if not self.mp3:
+            raise ValueError(f"Can't load ID3 data from {self.path}.")
+        if self.mp3.tag is None:
+            self.mp3.initTag()
+        tag=self.mp3.tag
+
+        self.track_num,self.track_max=tag.track_num
+        d=tag.getBestDate()
+        self.pub_date=datetime(
+            year=d.year,month=d.month,day=d.day,
+            hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
+            tzinfo=timezone.utc
+        )
+        self.creator=tag.artist
+        self.podcast=tag.album
+        self.title=tag.title
+        self.images=tag.images
+
+    def __str__(self):
+        return f"""\
+Path:    {self.path}
+Track:   {self.track_num} of {self.track_max}
+Podcast: {self.podcast}
+Creator: {self.creator}
+Title:   {self.title}
+Date:    {self.pub_date}
+Images:  {len(self.images)}
+"""
+
+def tag_episodes(podcast_path):
+    # Figure out what podcast we're working with.
+    print(f"Updating ID3 data for episodes in {podcast_path} ...")
+    if not podcast_path.is_dir():
+        say(f"Directory not found: {podcast_path}",1)
+    parts=podcast_path.parts[-2:]
+    n=len(parts)
+    if n!=2:
+        say(f"Directory must have at least two parts. ({n} found.)",1)
+    creator,podcast_name=parts
+    print(f"{creator=}, {podcast_name=}")
+
+    # Get our config file parameters.
+    conf_file=podcast_path/"podcaster.toml"
+    if not conf_file.is_file:
+        say("Configuration file {conf_file} not found.",1)
+    with open(conf_file,'rb') as f:
+        conf=tomllib.load(f)
+    group=conf.get('podcast',{})
+    cover=group.get('cover')
+    group=conf.get('episodes')
+    start_time=group.get('start_time',"2026-01-01T12:00:00")
+    start_time=datetime.fromisoformat(start_time).replace(tzinfo=timezone.utc)
+    time_interval=group.get("time_interval", dict(days=1))
+    time_interval=timedelta(**time_interval)
+    use_recording_date=group.get('use_recording_date',False)
+    if use_recording_date:
+        print("Using recording time of first track as time of the our first episode.")
+    else:
+        print(f"{start_time=}")
+        print(f"{time_interval=}")
+
+    # Get our list of podcast episodes so we can sort and iterate over them.
+    episodes=[Episode(fn) for fn in sorted(podcast_path.glob('*.mp3'))]
+    for ep in episodes:
+        print(ep)
+
+ap=ArgumentParser(
+    prog=Path(sys.argv[0]).stem,
+    description="Run a local RSS-based podcast service to let podcatchers on the local network download episodes from them. Podcasts and episodes are in a given directory structure on the local machine.",
+)
+ap.add_argument('--tag-episodes',metavar='DIR',action='store',help="Update the track, artist, album, release date, and album art according to the information in the podcasts.toml file in the given directory.")
+opt=ap.parse_args()
+
+def main():
+    if opt.tag_episodes:
+        try:
+            d=Path(opt.tag_episodes).absolute()
+        except Exception as e:
+            raise
+        tag_episodes(d)
+    else:
+        run_service()
 
 if __name__ == "__main__":
     main()
