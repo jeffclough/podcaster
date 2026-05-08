@@ -9,6 +9,7 @@ import tomllib
 import traceback
 import urllib.parse
 from argparse import ArgumentParser
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from feedgen.feed import FeedGenerator
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -93,31 +94,42 @@ class PodcastHandler(BaseHTTPRequestHandler):
 
             # 4. Generate Episodes
             # Set up to supply our own publication date values (just in case).
-            pub_date=start_time
-            for mp3 in sorted(podcast_path.glob("*.mp3")):
-                fe = fg.add_entry()
-                fe.id(mp3.name)
-                fe.title(mp3.stem)
+            if False:
+                pub_date=start_time
+                for mp3 in sorted(podcast_path.glob("*.mp3")):
+                    fe = fg.add_entry()
+                    fe.id(mp3.name)
+                    fe.title(mp3.stem)
 
-                # Either get the publication date from the MP3 file or use
-                # the pub_date value we're maintaining in this loop. In
-                # either case, set this episode's publication date
-                # accordingly.
-                if use_recording_date:
-                    afile = eyed3.load(mp3)
-                    if afile:
-                        d = afile.tag.getBestDate()
-                        pub_date = datetime(
-                            year=d.year, month=d.month, day=d.day,
-                            hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
-                            tzinfo=timezone.utc
-                        )
-                fe.pubDate(pub_date)
-                pub_date += time_interval
+                    # Either get the publication date from the MP3 file or use
+                    # the pub_date value we're maintaining in this loop. In
+                    # either case, set this episode's publication date
+                    # accordingly.
+                    if use_recording_date:
+                        afile = eyed3.load(mp3)
+                        if afile:
+                            d = afile.tag.getBestDate()
+                            pub_date = datetime(
+                                year=d.year, month=d.month, day=d.day,
+                                hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
+                                tzinfo=timezone.utc
+                            )
+                    fe.pubDate(pub_date)
+                    pub_date += time_interval
 
-                safe_name = urllib.parse.quote(mp3.name)
-                file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
-                fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
+                    safe_name = urllib.parse.quote(mp3.name)
+                    file_url = f"http://{LOCAL_IP}:{PORT}/{creator}/{podcast}/{safe_name}"
+                    fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
+
+            else:
+                episodes=[Episode(fn) for fn in sorted(podcast_path.glob("*.mp3"))]
+                for ep in episodes:
+                    fe=fg.add_entry()
+                    fe.id(ep.path.stem)
+                    fe.title(ep.title)
+                    fe.pubDate(ep.pub_date)
+                    quoted_path=urllib.parse.quote(str(ep.path))
+                    fe.enclosure(f"http://{LOCAL_IP}:{PORT}/{quoted_path}",str(ep.size),'audio/mpeg')
 
             response = fg.rss_str(pretty=True)
             self.send_response(200)
@@ -199,37 +211,166 @@ def say(msg,rc=None):
 
 class Episode():
     def __init__(self,path):
+        # Make sure the MP3 filename is a proper Path instance.
         if not isinstance(path,Path):
             path=Path(path)
         self.path=path
+
+        # Load the MP3 metadata.
         self.mp3=eyed3.load(self.path)
         if not self.mp3:
             raise ValueError(f"Can't load ID3 data from {self.path}.")
         if self.mp3.tag is None:
             self.mp3.initTag()
-        tag=self.mp3.tag
+        tag=self.mp3.tag # Just to make the code below simpler.
 
-        self.track_num,self.track_max=tag.track_num
-        d=tag.getBestDate()
-        self.pub_date=datetime(
-            year=d.year,month=d.month,day=d.day,
-            hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
-            tzinfo=timezone.utc
+        # Initialize our properties and state data for this episode.
+        # Be sure the datetime we get has no fractional seconds.
+        dt=tag.getBestDate()
+        dt=datetime(
+            year=dt.year,month=dt.month,day=dt.day,
+            hour=dt.hour or 0,minute=dt.minute or 0,second=int(dt.second or 0)
         )
-        self.creator=tag.artist
-        self.podcast=tag.album
-        self.title=tag.title
-        self.images=tag.images
+        for image in tag.images:
+            if image.picture_type==ImageFrame.FRONT_COVER:
+                image=image.image_data
+                break
+        else:
+            image=None
+        self._prop=dict(
+            creator=tag.artist,
+            podcast=tag.album,
+            episode=tag.track_num,
+            datetime=dt,
+            title=tag.title,
+            cover=image
+        )
+        self._is_dirty=dict(
+            creator=False,
+            podcast=False,
+            episode=False,
+            datetime=False,
+            title=False,
+            cover=False
+        )
+        self._in_context=False
+
+    def save(self):
+        """
+        Save any new tag data back to the MP3 file if there have been
+        any updates.
+        """
+
+        # Check for any dirty (i.e. changed) properties.
+        if any(self._is_dirty.values()):
+            # Update our MP3 tag data.
+            tag=self.mp3.tag
+            if self._is_dirty['creator']:
+                tag.artist=self._prop['creator']
+            if self._is_dirty['podcast']:
+                tag.album=self._prop['podcast']
+            if self._is_dirty['episode']:
+                tag.track_num=self._prop['episode']
+            if self._is_dirty['datetime']:
+                # Convert our datetime to ISO format.
+                tag.recording_date=self._prop['datetime'].isoformat()
+                tag.releasedate=tag.recording_date
+            if self._is_dirty['title']:
+                tag.title=self._prop['title']
+            if self._is_dirty['cover']:
+                tag.images.set(ImageFrame.FRONT_COVER,self.cover,"image/jpeg","Front Cover")
+
+            # Write the new tag data to the MP3 file as ID3v2.4 so we can write
+            # our datetime to the new high-precision TDRC and TDRL frames.
+            tags.save(str(self.path),v2_version=4)
+
+            # Clear all "dirty" flags.
+            for k in self._is_dirty:
+                self._is_dirty[k]=False
+
+    def _set_prop(self,key,val):
+        """
+        Set the given property value. If we're not in a context, write it
+        immediately to the MP3 file it came from. Otherwise, just mark
+        this property as "dirty" so it will be written when the caller
+        exits the current context.
+        """
+
+        if key not in self._prop:
+            raise ValueError(f"\"{key}\" is not a property of {__class__.__name__}.")
+        if self._prop[key]!=val:
+            self._prop[key]=val
+            self._is_dirty[key]=True
+        if not self._in_context:
+            self.save()
+
+    @property
+    def creator(self): return self._prop['creator']
+    @creator.setter
+    def creator(self,val): self._set_prop['creator',val]
+
+    @property
+    def podcast(self): return self._prop['podcast']
+    @podcast.setter
+    def podcast(self,val): self._set_prop['podcast',val]
+
+    @property
+    def episode(self): return self._prop['episode']
+    @episode.setter
+    def episode(self,val): self._set_prop['episode',val]
+
+    @property
+    def episode_num(self): return self._prop['episode'][0]
+    @ episode_num.setter
+    def episode_num(self,val):
+        self._set_prop('episode',(val,self._prop['episode'][1]))
+
+    @property
+    def episode_total(self): return self._prop['episode'][1]
+    @ episode_total.setter
+    def episode_total(self,val):
+        self._set_prop('episode',(self._prop['episode'][0],val))
+
+    @property
+    def datetime(self): return self._prop['datetime']
+    @datetime.setter
+    def datetime(self,val): self._set_prop['datetime',val]
+
+    @property
+    def title(self): return self._prop['title']
+    @title.setter
+    def title(self,val): self._set_prop['title',val]
+
+    @property
+    def cover(self): return self._prop['cover']
+    @cover.setter
+    def cover(self,val): self._set_prop['cover',val]
+
+    @contextmanager
+    def update(self):
+        """
+        Use `with some_episode.update():` to open a context block for
+        batching up several episode property updates to be written back
+        to the MP3 file they came from.
+        """
+
+        self._in_batch=True
+        try:
+            yield self
+        finally:
+            self._in_batch=False
+            self.save()
 
     def __str__(self):
+        cover='Present' if self.cover else 'None'
         return f"""\
 Path:    {self.path}
-Track:   {self.track_num} of {self.track_max}
 Podcast: {self.podcast}
 Creator: {self.creator}
+Episode: {self.episode}
+Date:    {self.datetime}
 Title:   {self.title}
-Date:    {self.pub_date}
-Images:  {len(self.images)}
+Cover:   {cover}
 """
 
 def tag_episodes(podcast_path):
