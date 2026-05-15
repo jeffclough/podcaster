@@ -11,6 +11,7 @@ import urllib.parse
 from argparse import ArgumentParser
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from debug import DebugChannel
 from feedgen.feed import FeedGenerator
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -18,6 +19,9 @@ from pathlib import Path
 # Configuration
 MEDIA_BASE_DIR = Path("~/Music/Podcasts").expanduser()
 PORT = 8080
+
+# Create a DebugChannel.
+dc = DebugChannel(False)
 
 def get_local_ip():
     """
@@ -78,6 +82,8 @@ class PodcastHandler(BaseHTTPRequestHandler):
             start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=timezone.utc)
             #time_interval = eval(group.get("time_interval", "timedelta(days=1)"))
             time_interval = timedelta(**time_interval)
+            dc(f"start_time={start_time.isoformat()}")
+            dc(f"{time_interval=}")
             use_recording_date = group.get("use_recording_date",False)
             
             # 3. Look for supplementary PDF
@@ -114,6 +120,7 @@ class PodcastHandler(BaseHTTPRequestHandler):
                                 hour=d.hour or 0,minute=d.minute or 0,second=d.second or 0,
                                 tzinfo=timezone.utc
                             )
+                            dc(f"{pub_date}={pub_daate.isoformat()}")
                     fe.pubDate(pub_date)
                     pub_date += time_interval
 
@@ -122,14 +129,20 @@ class PodcastHandler(BaseHTTPRequestHandler):
                     fe.enclosure(file_url, str(mp3.stat().st_size), 'audio/mpeg')
 
             else:
+                pub_date=start_time
                 episodes=[Episode(fn) for fn in sorted(podcast_path.glob("*.mp3"))]
                 for ep in episodes:
                     fe=fg.add_entry()
+                    if use_recording_date:
+                        pub_date=ep.datetime
                     fe.id(ep.path.stem)
                     fe.title(ep.title)
-                    fe.pubDate(ep.pub_date)
+                    dc(f"ep.datetime={ep.datetime.isoformat()}")
+                    fe.pubDate(ep.datetime)
                     quoted_path=urllib.parse.quote(str(ep.path))
                     fe.enclosure(f"http://{LOCAL_IP}:{PORT}/{quoted_path}",str(ep.size),'audio/mpeg')
+                    fe.pubDate(pub_date)
+                    pub_date += time_interval
 
             response = fg.rss_str(pretty=True)
             self.send_response(200)
@@ -159,6 +172,7 @@ class PodcastHandler(BaseHTTPRequestHandler):
 
 class PodcasterService:
     """Manages the lifecycle of the ThreadingHTTPServer."""
+
     def __init__(self):
         self.server = ThreadingHTTPServer(('', PORT), PodcastHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=False)
@@ -184,6 +198,7 @@ class PodcasterService:
 
     def stop(self, signum=None, frame=None):
         """Handles graceful shutdown on SIGINT/SIGTERM."""
+
         sig = signal.Signals(signum).name if signum else "Manual"
         print(f"\n[{sig}] Initiating graceful shutdown...")
         self.server.shutdown() # Stops the serve_forever loop cleanly
@@ -230,7 +245,8 @@ class Episode():
         dt=datetime(
             year=dt.year,month=dt.month,day=dt.day,
             hour=dt.hour or 0,minute=dt.minute or 0,second=int(dt.second or 0)
-        )
+        ).replace(tzinfo=timezone.utc)
+        dc(f"dt={dt.isoformat()}")
         for image in tag.images:
             if image.picture_type==ImageFrame.FRONT_COVER:
                 image=image.image_data
@@ -243,7 +259,8 @@ class Episode():
             episode=tag.track_num,
             datetime=dt,
             title=tag.title,
-            cover=image
+            cover=image,
+            size=self.mp3.info.size_bytes
         )
         self._is_dirty=dict(
             creator=False,
@@ -251,7 +268,7 @@ class Episode():
             episode=False,
             datetime=False,
             title=False,
-            cover=False
+            cover=False,
         )
         self._in_context=False
 
@@ -334,7 +351,11 @@ class Episode():
     @property
     def datetime(self): return self._prop['datetime']
     @datetime.setter
-    def datetime(self,val): self._set_prop['datetime',val]
+    def datetime(self,val):
+        if val.tzinfo is not None and val.tzinfo.utcoffset() is not None:
+            self._set_prop['datetime',val]
+        else:
+            self._set_prop['datetime',val.replace(tzinfo=timezone.utc)]
 
     @property
     def title(self): return self._prop['title']
@@ -345,6 +366,11 @@ class Episode():
     def cover(self): return self._prop['cover']
     @cover.setter
     def cover(self,val): self._set_prop['cover',val]
+
+    @property
+    def size(self): return self._prop['size']
+    @size.setter
+    def size(self,val): raise RuntimeError(f"{__class__.__name__}.size is read-only.")
 
     @contextmanager
     def update(self):
@@ -396,13 +422,13 @@ def tag_episodes(podcast_path):
     group=conf.get('episodes')
     start_time=group.get('start_time',"2026-01-01T12:00:00")
     start_time=datetime.fromisoformat(start_time).replace(tzinfo=timezone.utc)
-    time_interval=group.get("time_interval", dict(days=1))
+    #time_interval=group.get("time_interval", dict(days=1))
     time_interval=timedelta(**time_interval)
     use_recording_date=group.get('use_recording_date',False)
     if use_recording_date:
         print("Using recording time of first track as time of the our first episode.")
     else:
-        print(f"{start_time=}")
+        print(f"start_time={start_time.isoformat()}")
         print(f"{time_interval=}")
 
     # Get our list of podcast episodes so we can sort and iterate over them.
@@ -415,7 +441,11 @@ ap=ArgumentParser(
     description="Run a local RSS-based podcast service to let podcatchers on the local network download episodes from them. Podcasts and episodes are in a given directory structure on the local machine.",
 )
 ap.add_argument('--tag-episodes',metavar='DIR',action='store',help="Update the track, artist, album, release date, and album art according to the information in the podcasts.toml file in the given directory.")
+ap.add_argument('--debug',action='store_true',help="Enable debug output.")
 opt=ap.parse_args()
+
+# Enable our DebugChannel if --debug was on the command line.
+dc.enable(opt.debug)
 
 def main():
     if opt.tag_episodes:
